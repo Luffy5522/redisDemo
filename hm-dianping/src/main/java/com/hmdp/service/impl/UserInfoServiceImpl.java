@@ -1,25 +1,34 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.core.bean.BeanUtil;
+import cn.hutool.core.bean.copier.CopyOptions;
+import cn.hutool.core.lang.UUID;
 import cn.hutool.core.util.RandomUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.constants.RedisConstants;
+import com.hmdp.constants.SystemConstants;
 import com.hmdp.dto.LoginFormDTO;
 import com.hmdp.dto.Result;
+import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.User;
 import com.hmdp.entity.UserInfo;
 import com.hmdp.mapper.UserInfoMapper;
 import com.hmdp.mapper.UserMapper;
 import com.hmdp.service.IUserInfoService;
 import com.hmdp.utils.RegexUtils;
-import com.hmdp.utils.SystemConstants;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpSession;
 import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 /**
  * <p>
@@ -35,6 +44,9 @@ public class UserInfoServiceImpl extends ServiceImpl<UserInfoMapper, UserInfo> i
 
     @Resource
     UserMapper userMapper;
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
 
     /**
      * @param phone:   输入的手机号
@@ -57,9 +69,10 @@ public class UserInfoServiceImpl extends ServiceImpl<UserInfoMapper, UserInfo> i
         // 2.生成一组六位数的验证码
         String code = RandomUtil.randomNumbers(6);
 
-        // 3.保存验证码和手机到session
-        session.setAttribute(SystemConstants.code, code);
-        session.setAttribute(SystemConstants.phone, phone);
+        // 3.保存验证码和手机到redis
+        stringRedisTemplate.opsForValue().set(RedisConstants.LOGIN_CODE_KEY + phone,
+                code, RedisConstants.CACHE_NULL_TTL, TimeUnit.MINUTES);
+
 
         // 4.发送验证码
         log.info("验证码为:{}", code);
@@ -82,8 +95,11 @@ public class UserInfoServiceImpl extends ServiceImpl<UserInfoMapper, UserInfo> i
         String code = loginForm.getCode();
         String phone = loginForm.getPhone();
 
-        if (!code.equals(session.getAttribute(SystemConstants.code)) ||
-                !phone.equals(session.getAttribute(SystemConstants.phone))) {
+        // 从redis中获取验证码
+        String s = stringRedisTemplate.opsForValue().get(RedisConstants.LOGIN_CODE_KEY + phone);
+        if (s == null || !s.equals(code)) {
+            // 手机号和验证码不匹配
+            log.info("验证码错误");
             return Result.fail("验证码错误");
         }
 
@@ -95,15 +111,32 @@ public class UserInfoServiceImpl extends ServiceImpl<UserInfoMapper, UserInfo> i
 
         // 3.若用户不存在
         if (user == null) {
-            return register(loginForm, user);
+            // 创建新用户,并将用户保存到数据库
+            user = register(loginForm);
         }
+        assert user == null;
 
-        // 4.保存用户到session
-        session.setAttribute(SystemConstants.user, user);
+        // 4.生成随机的token
+        String token = UUID.randomUUID().toString();
+
+        UserDTO userDTO = BeanUtil.copyProperties(user, UserDTO.class);
+        Map<String, Object> stringObjectMap = BeanUtil.beanToMap(userDTO, new HashMap<>(),
+                CopyOptions.create()
+                        .setIgnoreNullValue(true)
+                        .setFieldValueEditor((fieldName, fieldValue) -> fieldValue.toString())
+        );
+
+        // 存储
+        stringRedisTemplate.opsForHash().putAll(RedisConstants.LOGIN_USER_KEY + token, stringObjectMap);
+
+        // 设置token有效期
+        stringRedisTemplate.expire(RedisConstants.LOGIN_USER_KEY + token,
+                RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
         return Result.ok("登录成功");
     }
 
-    public Result register(LoginFormDTO loginFormDTO, User user) {
+    public User register(LoginFormDTO loginFormDTO) {
+        User user = new User();
         log.info("进行注册");
         BeanUtils.copyProperties(loginFormDTO, user);
 
@@ -113,8 +146,8 @@ public class UserInfoServiceImpl extends ServiceImpl<UserInfoMapper, UserInfo> i
         user.setUpdateTime(LocalDateTime.now());
         userMapper.updateById(user);
 
-        return Result.ok("注册成功");
+        log.info("注册成功");
 
-
+        return user;
     }
 }
